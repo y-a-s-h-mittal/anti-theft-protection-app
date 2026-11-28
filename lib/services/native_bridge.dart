@@ -15,7 +15,24 @@ class PinStatus {
   const PinStatus(this.lockedMs, this.attemptsLeft);
 }
 
+class PermStatus {
+  final bool phone;
+  final bool notifications;
+  const PermStatus(this.phone, this.notifications);
+  bool get all => phone && notifications;
+}
+
 class NativeBridge {
+  static Future<PermStatus> permissionStatus() async {
+    final m = await _ch.invokeMapMethod<String, dynamic>('permissionStatus');
+    return PermStatus(
+      (m?['phone'] as bool?) ?? false,
+      (m?['notifications'] as bool?) ?? false,
+    );
+  }
+
+  static Future<void> openAppSettings() => _ch.invokeMethod('openAppSettings');
+
   static const _ch = MethodChannel('anti_theft/native');
 
   static Future<bool> requestPermissions() async =>
@@ -40,7 +57,7 @@ class NativeBridge {
   static Future<AuthResult> disarm(String pin) => _auth('disarm', {'pin': pin});
 
   static Future<AuthResult> setPin(String pin, {String? oldPin}) =>
-      _auth('setPin', {'pin': pin, if (oldPin != null) 'oldPin': oldPin});
+      _auth('setPin', {'pin': pin, 'oldPin': ?oldPin});
 
   static Future<AuthResult> _auth(String method, Map<String, dynamic> args) async {
     try {

@@ -16,6 +16,8 @@ import com.example.anti_theft_protection.state.SpikeLog
 import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
+import android.net.Uri
+import android.provider.Settings
 
 class ChannelHandler(private val activity: Activity) {
     companion object {
@@ -34,6 +36,18 @@ class ChannelHandler(private val activity: Activity) {
     fun register(messenger: BinaryMessenger) {
         MethodChannel(messenger, CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
+                "permissionStatus" -> result.success(
+                    mapOf(
+                        "phone" to granted(Manifest.permission.READ_PHONE_STATE),
+                        "notifications" to granted(Manifest.permission.POST_NOTIFICATIONS)
+                    )
+                )
+                "openAppSettings" -> {
+                    activity.startActivity(
+                        Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", activity.packageName, null))
+                    )
+                    result.success(null)
+                }
                 "requestPermissions" -> requestPermissions(result)
                 "arm" -> arm(result)
                 "disarm", "stopAlarm" -> disarm(call, result)   // same operation: PIN, then DISARMED
@@ -68,6 +82,9 @@ class ChannelHandler(private val activity: Activity) {
     private fun missingPermissions() = required.filter {
         ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
     }
+
+    private fun granted(p: String) =
+        ContextCompat.checkSelfPermission(activity, p) == PackageManager.PERMISSION_GRANTED
 
     private fun requestPermissions(result: MethodChannel.Result) {
         val missing = missingPermissions()

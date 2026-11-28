@@ -113,7 +113,7 @@ class MonitoringService : Service() {
             ProtectionState.DISARMED -> "Disarmed"
         }
         val b = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Anti-theft protection")
+            .setContentTitle("SIM Sentinel")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(open)

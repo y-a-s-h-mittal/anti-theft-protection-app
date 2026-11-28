@@ -2,7 +2,11 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import '../models/protection_state.dart';
 import '../services/native_bridge.dart';
-import '../widgets/pin_dialog.dart';
+import '../widgets/permission_flow.dart';
+import '../widgets/pin_flows.dart';
+import '../widgets/status_card.dart';
+import 'event_log_screen.dart';
+import 'settings_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -10,38 +14,49 @@ class HomeScreen extends StatefulWidget {
   State<HomeScreen> createState() => _HomeScreenState();
 }
 
-class _HomeScreenState extends State<HomeScreen> {
-  static final _pinRe = RegExp(r'^\d{4,8}$');
-
+class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   NativeStatus _status = const NativeStatus(
     state: ProtectionState.disarmed,
     serviceRunning: false,
   );
-  String _log = '';
-  double? _drag; // slider value while the finger is down
+  // Right after arming, the service needs a moment to start; don't flash a false warning.
+  DateTime _grace = DateTime.fromMillisecondsSinceEpoch(0);
   Timer? _timer;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _startPolling();
+  }
+
+  void _startPolling() {
+    _timer?.cancel();
     _refresh();
     _timer = Timer.periodic(const Duration(milliseconds: 500), (_) => _refresh());
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _startPolling();
+    } else {
+      _timer?.cancel(); // nobody can see the screen, so don't waste battery refreshing it
+      _timer = null;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _timer?.cancel();
     super.dispose();
   }
 
   Future<void> _refresh() async {
     final s = await NativeBridge.getStatus();
-    final log = await NativeBridge.getLog();
     if (!mounted) return;
-    setState(() {
-      _status = s;
-      _log = log;
-    });
+    setState(() => _status = s);
   }
 
   void _toast(String m) {
@@ -49,161 +64,107 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
   }
 
-  /// Turns Kotlin's answer into text for the dialog.
-  PinFeedback _feedback(AuthResult r) {
-    if (r.ok) return const PinFeedback.ok();
-    if (r.error != null) return PinFeedback(r.error!);
-    if (r.lockedMs > 0) return PinFeedback('Too many attempts', lockedMs: r.lockedMs);
-    final n = r.attemptsLeft;
-    if (n <= 0) return const PinFeedback('Wrong PIN');
-    return PinFeedback(n == 1 ? 'Wrong PIN. 1 attempt left' : 'Wrong PIN. $n attempts left');
-  }
-
-  String? _attemptsNote(PinStatus st) {
-    if (st.lockedMs > 0 || st.attemptsLeft >= 5) return null;
-    return st.attemptsLeft == 1 ? '1 attempt left' : '${st.attemptsLeft} attempts left';
-  }
+  void _open(Widget page) =>
+      Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => page));
 
   Future<void> _arm() async {
-    if (!await NativeBridge.requestPermissions()) {
-      _toast('Permissions missing - not armed');
-      return;
-    }
+    if (!await ensurePermissions(context)) return;
+    _grace = DateTime.now().add(const Duration(seconds: 3));
     final err = await NativeBridge.arm();
     if (err != null) _toast(err);
     _refresh();
   }
 
   Future<void> _disarm() async {
-    final st = await NativeBridge.pinStatus();
-    if (!mounted) return;
-    await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => PinDialog(
-        title: _status.state == ProtectionState.alarming
-            ? 'Enter PIN to stop the alarm'
-            : 'Enter PIN to disarm',
-        labels: const ['PIN'],
-        initialLockedMs: st.lockedMs,
-        initialMessage: _attemptsNote(st),
-        onSubmit: (v) async {
-          // Obviously malformed PINs are rejected here without using up an attempt.
-          if (!_pinRe.hasMatch(v[0])) return const PinFeedback('PIN must be 4-8 digits');
-          return _feedback(await NativeBridge.disarm(v[0]));
-        },
-      ),
-    );
+    await showDisarmDialog(context, alarming: _status.state == ProtectionState.alarming);
     _refresh();
   }
 
   Future<void> _setPin() async {
-    final hasOld = _status.hasPin;
-    final st = await NativeBridge.pinStatus();
-    if (!mounted) return;
-    final saved = await showDialog<bool>(
-      context: context,
-      barrierDismissible: false,
-      builder: (_) => PinDialog(
-        title: hasOld ? 'Change PIN' : 'Set PIN',
-        labels: [if (hasOld) 'Current PIN', 'New PIN (4-8 digits)', 'Repeat new PIN'],
-        initialLockedMs: hasOld ? st.lockedMs : 0,
-        initialMessage: hasOld ? _attemptsNote(st) : null,
-        onSubmit: (v) async {
-          final old = hasOld ? v[0] : null;
-          final a = v[hasOld ? 1 : 0];
-          final b = v[hasOld ? 2 : 1];
-          if (old != null && !_pinRe.hasMatch(old)) return const PinFeedback('Enter your current PIN (4-8 digits)');
-          if (!_pinRe.hasMatch(a)) return const PinFeedback('New PIN must be 4-8 digits');
-          if (a != b) return const PinFeedback('PINs do not match');
-          return _feedback(await NativeBridge.setPin(a, oldPin: old));
-        },
+    final saved = await showSetPinDialog(context, hasPin: _status.hasPin);
+    if (saved) _toast('PIN saved');
+    _refresh();
+  }
+
+  Widget _bigButton(IconData icon, String label, VoidCallback onTap, {Color? color}) {
+    return SizedBox(
+      width: double.infinity,
+      height: 64,
+      child: FilledButton.icon(
+        onPressed: onTap,
+        style: color == null ? null : FilledButton.styleFrom(backgroundColor: color),
+        icon: Icon(icon),
+        label: Text(label, style: const TextStyle(fontSize: 18)),
       ),
     );
-    if (saved == true) _toast('PIN saved');
-    _refresh();
   }
 
-  Future<void> _testAlarm() async {
-    final err = await NativeBridge.testAlarm();
-    _toast(err ?? 'Test alarm playing for 5 s');
+  Widget _mainButton() {
+    final s = _status;
+    switch (s.state) {
+      case ProtectionState.disarmed:
+        if (!s.hasPin) return _bigButton(Icons.pin, 'Set a PIN to begin', _setPin);
+        return _bigButton(Icons.shield, 'Arm protection', _arm);
+      case ProtectionState.armed:
+      case ProtectionState.countdown:
+        return _bigButton(Icons.lock_open, 'Disarm', _disarm);
+      case ProtectionState.alarming:
+        return _bigButton(Icons.notifications_off, 'Stop alarm', _disarm,
+            color: Colors.red.shade700);
+    }
   }
 
-  Future<void> _saveSeconds(double v) async {
-    final err = await NativeBridge.setCountdownSeconds(v.round());
-    if (err != null) _toast(err);
-    _drag = null;
-    _refresh();
+  String _hint() {
+    final s = _status;
+    switch (s.state) {
+      case ProtectionState.disarmed:
+        return s.hasPin
+            ? 'Arm before you leave. If the SIM is removed while armed, the alarm '
+            'sounds ${s.countdownSeconds} s later.'
+            : 'You need a PIN to arm, disarm or stop the alarm.';
+      case ProtectionState.armed:
+        return 'You can close the app and lock the phone. Monitoring continues in the background.';
+      case ProtectionState.countdown:
+        return 'Putting the same SIM back before the countdown ends cancels it.';
+      case ProtectionState.alarming:
+        return 'Only the PIN stops the alarm. Reinserting the SIM does not.';
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final s = _status;
-    final disarmed = s.state == ProtectionState.disarmed;
-    final alarming = s.state == ProtectionState.alarming;
-    final notRunning = !disarmed && !s.serviceRunning;
-    final double secs = _drag ?? s.countdownSeconds.toDouble();
-    final title = s.state == ProtectionState.countdown
-        ? 'COUNTDOWN  ${(s.remainingMs / 1000).ceil()} s'
-        : s.state.name.toUpperCase();
+    final starting = s.state != ProtectionState.disarmed &&
+        !s.serviceRunning &&
+        DateTime.now().isBefore(_grace);
+    final notRunning = s.state != ProtectionState.disarmed && !s.serviceRunning && !starting;
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Anti-theft (Milestone 1C.1)')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(title,
-              style: Theme.of(context)
-                  .textTheme
-                  .headlineMedium
-                  ?.copyWith(color: alarming ? Colors.red : null)),
-          if (notRunning)
-            const Text(
-              'Monitoring service is NOT running - protection is not active',
-              style: TextStyle(color: Colors.red),
-            ),
-          if (!s.hasPin)
-            const Text('No PIN set - set one before arming',
-                style: TextStyle(color: Colors.orange)),
-          const SizedBox(height: 8),
-          Text('Countdown: ${secs.round()} s (5-60, change while disarmed)'),
-          Slider(
-            min: 5,
-            max: 60,
-            divisions: 55,
-            value: secs,
-            label: '${secs.round()} s',
-            onChanged: disarmed ? (v) => setState(() => _drag = v) : null,
-            onChangeEnd: disarmed ? _saveSeconds : null,
+      appBar: AppBar(
+        title: const Text('SIM Sentinel'),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.receipt_long),
+            tooltip: 'Debug log',
+            onPressed: () => _open(const EventLogScreen()),
           ),
-          Wrap(spacing: 8, children: [
-            ElevatedButton(onPressed: disarmed ? _arm : null, child: const Text('Arm')),
-            ElevatedButton(
-              onPressed: disarmed ? null : _disarm,
-              child: Text(alarming ? 'Stop alarm' : 'Disarm'),
-            ),
-            OutlinedButton(
-              onPressed: disarmed ? _setPin : null,
-              child: Text(s.hasPin ? 'Change PIN' : 'Set PIN'),
-            ),
-            OutlinedButton(
-              onPressed: disarmed ? _testAlarm : null,
-              child: const Text('Test alarm'),
-            ),
-            OutlinedButton(
-              onPressed: () async {
-                await NativeBridge.clearLog();
-                _refresh();
-              },
-              child: const Text('Clear log'),
-            ),
-          ]),
-          const Divider(),
-          Expanded(
-            child: SingleChildScrollView(
-              child: SelectableText(_log,
-                  style: const TextStyle(fontFamily: 'monospace', fontSize: 12)),
-            ),
+          IconButton(
+            icon: const Icon(Icons.settings),
+            tooltip: 'Settings',
+            onPressed: () => _open(const SettingsScreen()),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: ListView(padding: const EdgeInsets.all(16), children: [
+          StatusCard(status: s, showNotRunning: notRunning, starting: starting),
+          const SizedBox(height: 16),
+          _mainButton(),
+          const SizedBox(height: 16),
+          Text(
+            _hint(),
+            textAlign: TextAlign.center,
+            style: Theme.of(context).textTheme.bodyMedium,
           ),
         ]),
       ),
