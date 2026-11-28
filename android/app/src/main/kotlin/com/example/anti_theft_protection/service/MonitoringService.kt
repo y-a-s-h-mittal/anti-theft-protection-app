@@ -4,9 +4,11 @@ import android.app.*
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.anti_theft_protection.MainActivity
+import com.example.anti_theft_protection.alarm.CountdownManager
 import com.example.anti_theft_protection.sim.SimMonitor
 import com.example.anti_theft_protection.state.ProtectionState
 import com.example.anti_theft_protection.state.ProtectionStore
@@ -20,6 +22,12 @@ class MonitoringService : Service() {
     }
 
     private var monitor: SimMonitor? = null
+    private lateinit var countdown: CountdownManager   // needs a real Context, so built in onCreate
+
+    override fun onCreate() {
+        super.onCreate()
+        countdown = CountdownManager(this) { onCountdownExpired() }
+    }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val state = ProtectionStore.getState(this)
@@ -43,25 +51,42 @@ class MonitoringService : Service() {
                 onRemovalConfirmed = { onRemoval() },
                 onRestoreConfirmed = { onRestored() },
             ).also { it.start() }
+
+            if (state == ProtectionState.COUNTDOWN) {   // service was recreated mid-countdown
+                val latest = SystemClock.elapsedRealtime() + ProtectionStore.getCountdownSeconds(this) * 1000L
+                countdown.start(minOf(ProtectionStore.getDeadline(this), latest))
+                SpikeLog.add(this, "COUNTDOWN resumed after service restart")
+            }
         }
         running = true
         return START_STICKY
     }
 
     private fun onRemoval() {
-        if (ProtectionStore.getState(this) == ProtectionState.ARMED) {
-            ProtectionStore.setState(this, ProtectionState.COUNTDOWN)
-            SpikeLog.add(this, "STATE ARMED -> COUNTDOWN (removal confirmed)")
-            refreshNotification()
-        }
+        if (ProtectionStore.getState(this) != ProtectionState.ARMED) return
+        val secs = ProtectionStore.getCountdownSeconds(this)
+        // Measure from when the SIM first went missing, not from debounce confirmation.
+        val deadline = SystemClock.elapsedRealtime() + secs * 1000L - SimMonitor.REMOVAL_DEBOUNCE_MS
+        ProtectionStore.startCountdown(this, deadline)
+        SpikeLog.add(this, "STATE ARMED -> COUNTDOWN (removal confirmed, setting ${secs}s)")
+        countdown.start(deadline)
+        refreshNotification()
     }
 
     private fun onRestored() {
-        if (ProtectionStore.getState(this) == ProtectionState.COUNTDOWN) {
-            ProtectionStore.setState(this, ProtectionState.ARMED)
-            SpikeLog.add(this, "STATE COUNTDOWN -> ARMED (original SIM restored)")
-            refreshNotification()
-        }
+        if (ProtectionStore.getState(this) != ProtectionState.COUNTDOWN) return  // ALARMING stays latched
+        countdown.cancel()
+        ProtectionStore.setState(this, ProtectionState.ARMED)
+        SpikeLog.add(this, "STATE COUNTDOWN -> ARMED (original SIM restored)")
+        refreshNotification()
+    }
+
+    private fun onCountdownExpired() {
+        if (ProtectionStore.getState(this) != ProtectionState.COUNTDOWN) return
+        ProtectionStore.setState(this, ProtectionState.ALARMING)
+        SpikeLog.add(this, "STATE COUNTDOWN -> ALARMING (countdown expired)")
+        refreshNotification()
+        // Stage 1C: start AlarmPlayer here.
     }
 
     private fun buildNotification(state: ProtectionState): Notification {
@@ -75,18 +100,25 @@ class MonitoringService : Service() {
         )
         val text = when (state) {
             ProtectionState.ARMED -> "Armed: watching the SIM"
-            ProtectionState.COUNTDOWN -> "SIM missing: countdown"
+            ProtectionState.COUNTDOWN -> "SIM missing: alarm in"
             ProtectionState.ALARMING -> "ALARM ACTIVE"
             ProtectionState.DISARMED -> "Disarmed"
         }
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val b = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Anti-theft protection")
             .setContentText(text)
             .setSmallIcon(android.R.drawable.ic_lock_idle_lock)
             .setContentIntent(open)
             .setOngoing(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .build()
+        if (state == ProtectionState.COUNTDOWN) {
+            // Built-in chronometer ticks by itself, so it costs no wake-ups.
+            b.setUsesChronometer(true)
+                .setChronometerCountDown(true)
+                .setShowWhen(true)
+                .setWhen(System.currentTimeMillis() + ProtectionStore.remainingMs(this))
+        }
+        return b.build()
     }
 
     private fun refreshNotification() {
@@ -95,6 +127,7 @@ class MonitoringService : Service() {
     }
 
     override fun onDestroy() {
+        countdown.cancel()
         monitor?.stop()
         monitor = null
         running = false

@@ -15,5 +15,13 @@ enum ProtectionState {
 class NativeStatus {
   final ProtectionState state;
   final bool serviceRunning;
-  const NativeStatus(this.state, this.serviceRunning);
+  final int remainingMs;
+  final int countdownSeconds;
+
+  const NativeStatus({
+    required this.state,
+    required this.serviceRunning,
+    this.remainingMs = 0,
+    this.countdownSeconds = 10,
+  });
 }

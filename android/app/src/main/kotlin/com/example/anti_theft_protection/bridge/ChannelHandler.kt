@@ -12,6 +12,7 @@ import com.example.anti_theft_protection.state.ProtectionState
 import com.example.anti_theft_protection.state.ProtectionStore
 import com.example.anti_theft_protection.state.SpikeLog
 import io.flutter.plugin.common.BinaryMessenger
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 
 class ChannelHandler(private val activity: Activity) {
@@ -32,6 +33,7 @@ class ChannelHandler(private val activity: Activity) {
                 "requestPermissions" -> requestPermissions(result)
                 "arm" -> arm(result)
                 "disarm" -> disarm(result)
+                "setCountdownSeconds" -> setCountdownSeconds(call, result)
                 "getStatus" -> result.success(status())
                 "getLog" -> result.success(SpikeLog.read(activity))
                 "clearLog" -> { SpikeLog.clear(activity); result.success(null) }
@@ -42,7 +44,9 @@ class ChannelHandler(private val activity: Activity) {
 
     private fun status(): Map<String, Any> = mapOf(
         "state" to ProtectionStore.getState(activity).name,
-        "serviceRunning" to MonitoringService.running
+        "serviceRunning" to MonitoringService.running,
+        "remainingMs" to ProtectionStore.remainingMs(activity),
+        "countdownSeconds" to ProtectionStore.getCountdownSeconds(activity)
     )
 
     private fun missingPermissions() = required.filter {
@@ -74,12 +78,11 @@ class ChannelHandler(private val activity: Activity) {
             result.error("PERMISSION", "Phone and notification permissions are required", null); return
         }
         val ids = SimMonitor.readActiveIds(activity)
-        when {
-            ids == null -> { result.error("NO_ACCESS", "Cannot read SIM state", null); return }
-            ids.isEmpty() -> { result.error("NO_SIM", "No active SIM found to monitor", null); return }
-            ids.size > 1 -> { result.error("MULTI_SIM", "Only single-SIM phones are supported so far", null); return }
-        }
-        val baseline = ids!!.first()
+        if (ids == null) { result.error("NO_ACCESS", "Cannot read SIM state", null); return }
+        if (ids.isEmpty()) { result.error("NO_SIM", "No active SIM found to monitor", null); return }
+        if (ids.size > 1) { result.error("MULTI_SIM", "Only single-SIM phones are supported so far", null); return }
+
+        val baseline = ids.first()
         ProtectionStore.arm(activity, baseline)
         SpikeLog.add(activity, "STATE DISARMED -> ARMED (baseline id=$baseline)")
         ContextCompat.startForegroundService(activity, Intent(activity, MonitoringService::class.java))
@@ -87,13 +90,21 @@ class ChannelHandler(private val activity: Activity) {
     }
 
     private fun disarm(result: MethodChannel.Result) {
+        // TEMP (Stage 1B): disarming from ALARMING needs no PIN yet. Stage 1C removes this.
         val before = ProtectionStore.getState(activity)
-        if (before == ProtectionState.ALARMING) {
-            result.error("ALARM_ACTIVE", "Enter the PIN to stop the alarm", null); return
-        }
         ProtectionStore.disarm(activity)
         activity.stopService(Intent(activity, MonitoringService::class.java))
         SpikeLog.add(activity, "STATE $before -> DISARMED (owner)")
+        result.success(status())
+    }
+
+    private fun setCountdownSeconds(call: MethodCall, result: MethodChannel.Result) {
+        if (ProtectionStore.getState(activity) != ProtectionState.DISARMED) {
+            result.error("NOT_DISARMED", "Disarm first to change the countdown", null); return
+        }
+        val seconds = call.argument<Int>("seconds")
+        if (seconds == null) { result.error("BAD_ARGS", "seconds is required", null); return }
+        ProtectionStore.setCountdownSeconds(activity, seconds)
         result.success(status())
     }
 }
