@@ -4,8 +4,15 @@ import '../models/protection_state.dart';
 class AuthResult {
   final bool ok;
   final int lockedMs;
+  final int attemptsLeft;
   final String? error;
-  const AuthResult(this.ok, this.lockedMs, {this.error});
+  const AuthResult(this.ok, this.lockedMs, this.attemptsLeft, {this.error});
+}
+
+class PinStatus {
+  final int lockedMs;
+  final int attemptsLeft;
+  const PinStatus(this.lockedMs, this.attemptsLeft);
 }
 
 class NativeBridge {
@@ -41,10 +48,19 @@ class NativeBridge {
       return AuthResult(
         (m?['ok'] as bool?) ?? false,
         (m?['lockedMs'] as num?)?.toInt() ?? 0,
+        (m?['attemptsLeft'] as num?)?.toInt() ?? 0,
       );
     } on PlatformException catch (e) {
-      return AuthResult(false, 0, error: e.message ?? e.code);
+      return AuthResult(false, 0, 0, error: e.message ?? e.code);
     }
+  }
+
+  static Future<PinStatus> pinStatus() async {
+    final m = await _ch.invokeMapMethod<String, dynamic>('pinStatus');
+    return PinStatus(
+      (m?['lockedMs'] as num?)?.toInt() ?? 0,
+      (m?['attemptsLeft'] as num?)?.toInt() ?? 5,
+    );
   }
 
   static Future<NativeStatus> getStatus() async {

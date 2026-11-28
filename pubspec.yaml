@@ -1,5 +1,5 @@
 name: anti_theft_protection
-description: "A new Flutter project."
+description: "Personal Android anti-theft alarm: detects SIM removal, runs a native countdown, and sounds a PIN-protected alarm."
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev

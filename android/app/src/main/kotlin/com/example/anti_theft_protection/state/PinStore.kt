@@ -8,7 +8,7 @@ import java.security.SecureRandom
 import javax.crypto.SecretKeyFactory
 import javax.crypto.spec.PBEKeySpec
 
-data class VerifyResult(val ok: Boolean, val lockedMs: Long = 0L)
+data class VerifyResult(val ok: Boolean, val lockedMs: Long = 0L, val attemptsLeft: Int = 0)
 
 /** Salted PBKDF2 PIN hash with persisted retry lockout. The PIN itself is never stored or logged. */
 object PinStore {
@@ -60,18 +60,24 @@ object PinStore {
         return if (now < start) dur else (start + dur - now).coerceAtLeast(0L)
     }
 
+    /** Wrong guesses left before the next lock. After a lock has expired, one more mistake locks again. */
+    fun attemptsLeft(ctx: Context): Int {
+        val fails = prefs(ctx).getInt(K_FAILS, 0)
+        return if (fails >= FREE_ATTEMPTS) 1 else FREE_ATTEMPTS - fails
+    }
+
     fun verify(ctx: Context, pin: String): VerifyResult {
         val locked = lockRemainingMs(ctx)
-        if (locked > 0) return VerifyResult(false, locked)   // attempts during a lock are not even checked
+        if (locked > 0) return VerifyResult(false, locked, 0)   // attempts during a lock are not even checked
 
         val p = prefs(ctx)
         val salt = p.getString(K_SALT, null)?.let { Base64.decode(it, Base64.NO_WRAP) }
         val stored = p.getString(K_HASH, null)?.let { Base64.decode(it, Base64.NO_WRAP) }
-        if (salt == null || stored == null) return VerifyResult(false)
+        if (salt == null || stored == null) return VerifyResult(false, 0L, attemptsLeft(ctx))
 
         if (MessageDigest.isEqual(hash(pin, salt), stored)) {   // constant-time compare
             p.edit().putInt(K_FAILS, 0).remove(K_LOCK_START).remove(K_LOCK_DUR).apply()
-            return VerifyResult(true)
+            return VerifyResult(true, 0L, FREE_ATTEMPTS)
         }
 
         val fails = p.getInt(K_FAILS, 0) + 1
@@ -82,6 +88,6 @@ object PinStore {
             e.putLong(K_LOCK_START, SystemClock.elapsedRealtime()).putLong(K_LOCK_DUR, lockMs)
         }
         e.apply()
-        return VerifyResult(false, lockMs)
+        return VerifyResult(false, lockMs, attemptsLeft(ctx))
     }
 }

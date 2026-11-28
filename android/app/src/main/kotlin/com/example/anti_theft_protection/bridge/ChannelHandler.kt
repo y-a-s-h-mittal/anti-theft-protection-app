@@ -38,6 +38,12 @@ class ChannelHandler(private val activity: Activity) {
                 "arm" -> arm(result)
                 "disarm", "stopAlarm" -> disarm(call, result)   // same operation: PIN, then DISARMED
                 "setPin" -> setPin(call, result)
+                "pinStatus" -> result.success(
+                    mapOf(
+                        "lockedMs" to PinStore.lockRemainingMs(activity),
+                        "attemptsLeft" to PinStore.attemptsLeft(activity)
+                    )
+                )
                 "testAlarm" -> testAlarm(result)
                 "setCountdownSeconds" -> setCountdownSeconds(call, result)
                 "getStatus" -> result.success(status())
@@ -56,8 +62,8 @@ class ChannelHandler(private val activity: Activity) {
         "hasPin" to PinStore.hasPin(activity)
     )
 
-    private fun auth(ok: Boolean, lockedMs: Long = 0L): Map<String, Any> =
-        mapOf("ok" to ok, "lockedMs" to lockedMs)
+    private fun auth(ok: Boolean, lockedMs: Long = 0L, attemptsLeft: Int = 0): Map<String, Any> =
+        mapOf("ok" to ok, "lockedMs" to lockedMs, "attemptsLeft" to attemptsLeft)
 
     private fun missingPermissions() = required.filter {
         ContextCompat.checkSelfPermission(activity, it) != PackageManager.PERMISSION_GRANTED
@@ -110,7 +116,7 @@ class ChannelHandler(private val activity: Activity) {
         if (!v.ok) {
             // Never reveal how close a wrong PIN was.
             SpikeLog.add(activity, if (v.lockedMs > 0) "AUTH: rejected, locked ${v.lockedMs / 1000}s" else "AUTH: wrong PIN")
-            result.success(auth(false, v.lockedMs)); return
+            result.success(auth(false, v.lockedMs, v.attemptsLeft)); return
         }
         ProtectionStore.disarm(activity)
         activity.stopService(Intent(activity, MonitoringService::class.java))   // service onDestroy stops the alarm
@@ -128,7 +134,10 @@ class ChannelHandler(private val activity: Activity) {
         }
         if (PinStore.hasPin(activity)) {   // changing an existing PIN needs the old one
             val v = PinStore.verify(activity, call.argument<String>("oldPin") ?: "")
-            if (!v.ok) { result.success(auth(false, v.lockedMs)); return }
+            if (!v.ok) {
+                SpikeLog.add(activity, if (v.lockedMs > 0) "AUTH: PIN change rejected, locked ${v.lockedMs / 1000}s" else "AUTH: PIN change, wrong current PIN")
+                result.success(auth(false, v.lockedMs, v.attemptsLeft)); return
+            }
         }
         PinStore.setPin(activity, pin)
         SpikeLog.add(activity, "PIN saved")

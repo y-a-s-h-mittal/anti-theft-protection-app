@@ -1,8 +1,8 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import '../models/protection_state.dart';
 import '../services/native_bridge.dart';
+import '../widgets/pin_dialog.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -11,6 +11,8 @@ class HomeScreen extends StatefulWidget {
 }
 
 class _HomeScreenState extends State<HomeScreen> {
+  static final _pinRe = RegExp(r'^\d{4,8}$');
+
   NativeStatus _status = const NativeStatus(
     state: ProtectionState.disarmed,
     serviceRunning: false,
@@ -47,19 +49,19 @@ class _HomeScreenState extends State<HomeScreen> {
     ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(m)));
   }
 
-  void _authToast(AuthResult r) {
-    if (r.error != null) {
-      _toast(r.error!);
-    } else if (r.lockedMs > 0) {
-      _toast('Too many attempts. Try again in ${(r.lockedMs / 1000).ceil()} s');
-    } else {
-      _toast('Wrong PIN');
-    }
+  /// Turns Kotlin's answer into text for the dialog.
+  PinFeedback _feedback(AuthResult r) {
+    if (r.ok) return const PinFeedback.ok();
+    if (r.error != null) return PinFeedback(r.error!);
+    if (r.lockedMs > 0) return PinFeedback('Too many attempts', lockedMs: r.lockedMs);
+    final n = r.attemptsLeft;
+    if (n <= 0) return const PinFeedback('Wrong PIN');
+    return PinFeedback(n == 1 ? 'Wrong PIN. 1 attempt left' : 'Wrong PIN. $n attempts left');
   }
 
-  Future<String?> _askPin(String title) async {
-    if (!mounted) return null;
-    return showDialog<String>(context: context, builder: (_) => _PinDialog(title));
+  String? _attemptsNote(PinStatus st) {
+    if (st.lockedMs > 0 || st.attemptsLeft >= 5) return null;
+    return st.attemptsLeft == 1 ? '1 attempt left' : '${st.attemptsLeft} attempts left';
   }
 
   Future<void> _arm() async {
@@ -73,33 +75,52 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _disarm() async {
-    final pin = await _askPin('Enter PIN');
-    if (pin == null) return;
-    final r = await NativeBridge.disarm(pin);
-    if (!r.ok) _authToast(r);
+    final st = await NativeBridge.pinStatus();
+    if (!mounted) return;
+    await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PinDialog(
+        title: _status.state == ProtectionState.alarming
+            ? 'Enter PIN to stop the alarm'
+            : 'Enter PIN to disarm',
+        labels: const ['PIN'],
+        initialLockedMs: st.lockedMs,
+        initialMessage: _attemptsNote(st),
+        onSubmit: (v) async {
+          // Obviously malformed PINs are rejected here without using up an attempt.
+          if (!_pinRe.hasMatch(v[0])) return const PinFeedback('PIN must be 4-8 digits');
+          return _feedback(await NativeBridge.disarm(v[0]));
+        },
+      ),
+    );
     _refresh();
   }
 
   Future<void> _setPin() async {
-    String? old;
-    if (_status.hasPin) {
-      old = await _askPin('Current PIN');
-      if (old == null) return;
-    }
-    final a = await _askPin('New PIN (4-8 digits)');
-    if (a == null) return;
-    final b = await _askPin('Repeat new PIN');
-    if (b == null) return;
-    if (a != b) {
-      _toast('PINs do not match');
-      return;
-    }
-    final r = await NativeBridge.setPin(a, oldPin: old);
-    if (r.ok) {
-      _toast('PIN saved');
-    } else {
-      _authToast(r);
-    }
+    final hasOld = _status.hasPin;
+    final st = await NativeBridge.pinStatus();
+    if (!mounted) return;
+    final saved = await showDialog<bool>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => PinDialog(
+        title: hasOld ? 'Change PIN' : 'Set PIN',
+        labels: [if (hasOld) 'Current PIN', 'New PIN (4-8 digits)', 'Repeat new PIN'],
+        initialLockedMs: hasOld ? st.lockedMs : 0,
+        initialMessage: hasOld ? _attemptsNote(st) : null,
+        onSubmit: (v) async {
+          final old = hasOld ? v[0] : null;
+          final a = v[hasOld ? 1 : 0];
+          final b = v[hasOld ? 2 : 1];
+          if (old != null && !_pinRe.hasMatch(old)) return const PinFeedback('Enter your current PIN (4-8 digits)');
+          if (!_pinRe.hasMatch(a)) return const PinFeedback('New PIN must be 4-8 digits');
+          if (a != b) return const PinFeedback('PINs do not match');
+          return _feedback(await NativeBridge.setPin(a, oldPin: old));
+        },
+      ),
+    );
+    if (saved == true) _toast('PIN saved');
     _refresh();
   }
 
@@ -127,7 +148,7 @@ class _HomeScreenState extends State<HomeScreen> {
         : s.state.name.toUpperCase();
 
     return Scaffold(
-      appBar: AppBar(title: const Text('Anti-theft (Milestone 1C)')),
+      appBar: AppBar(title: const Text('Anti-theft (Milestone 1C.1)')),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
@@ -186,44 +207,6 @@ class _HomeScreenState extends State<HomeScreen> {
           ),
         ]),
       ),
-    );
-  }
-}
-
-/// Owns its controller so it is disposed together with the dialog.
-class _PinDialog extends StatefulWidget {
-  final String title;
-  const _PinDialog(this.title);
-  @override
-  State<_PinDialog> createState() => _PinDialogState();
-}
-
-class _PinDialogState extends State<_PinDialog> {
-  final _c = TextEditingController();
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return AlertDialog(
-      title: Text(widget.title),
-      content: TextField(
-        controller: _c,
-        autofocus: true,
-        obscureText: true,
-        keyboardType: TextInputType.number,
-        maxLength: 8,
-        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-        decoration: const InputDecoration(hintText: '4-8 digits'),
-      ),
-      actions: [
-        TextButton(onPressed: () => Navigator.pop(context), child: const Text('Cancel')),
-        TextButton(onPressed: () => Navigator.pop(context, _c.text), child: const Text('OK')),
-      ],
     );
   }
 }

@@ -1,6 +1,9 @@
 package com.example.anti_theft_protection.alarm
 
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -10,6 +13,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
+import androidx.core.content.ContextCompat
 import com.example.anti_theft_protection.state.SpikeLog
 
 /**
@@ -18,8 +22,12 @@ import com.example.anti_theft_protection.state.SpikeLog
  */
 class AlarmPlayer(private val ctx: Context) {
     companion object {
-        private const val TICK_MS = 250L
-        private const val RAW_NAME = "atp_alarm"   // res/raw/atp_alarm.mp3
+        private const val TICK_MS = 100L
+        private const val WAKE_REFRESH_TICKS = 100   // renew the wake lock every ~10 s
+        private const val RAW_NAME = "atp_alarm"     // res/raw/atp_alarm.<any extension>
+        // Not a public SDK constant, but a long-standing system broadcast sent on every volume change.
+        private const val VOLUME_CHANGED_ACTION = "android.media.VOLUME_CHANGED_ACTION"
+        private const val EXTRA_STREAM_TYPE = "android.media.EXTRA_VOLUME_STREAM_TYPE"
     }
 
     private val audio = ctx.getSystemService(AudioManager::class.java)
@@ -44,15 +52,27 @@ class AlarmPlayer(private val ctx: Context) {
     private var player: MediaPlayer? = null
     private var savedVolume: Int? = null
     private var active = false
-    private var volumeWarned = false
+    private var ticks = 0
+    private var volumeErrorLogged = false
+    private var receiverRegistered = false
 
     val isPlaying: Boolean get() = active
 
+    /** Reacts the instant the system reports an alarm-stream volume change. */
+    private val volumeReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (active && intent?.getIntExtra(EXTRA_STREAM_TYPE, -1) == AudioManager.STREAM_ALARM) {
+                forceMaxVolume()
+            }
+        }
+    }
+
+    /** Backup in case the broadcast is ever not delivered. */
     private val tick = object : Runnable {
         override fun run() {
             if (!active) return
             forceMaxVolume()
-            wakeLock.acquire(30_000L)   // refreshed every tick; expires by itself if this loop ever dies
+            if (++ticks % WAKE_REFRESH_TICKS == 0) wakeLock.acquire(30_000L)
             handler.postDelayed(this, TICK_MS)
         }
     }
@@ -60,12 +80,18 @@ class AlarmPlayer(private val ctx: Context) {
     fun start(autoStopMs: Long? = null) {
         if (active) return
         active = true
-        volumeWarned = false
+        ticks = 0
+        volumeErrorLogged = false
         wakeLock.acquire(30_000L)
         savedVolume = runCatching { audio.getStreamVolume(AudioManager.STREAM_ALARM) }.getOrNull()
         val focus = runCatching { audio.requestAudioFocus(focusRequest) }.getOrElse { -1 }
         SpikeLog.add(ctx, "ALARM: audio focus result=$focus (1=granted, 0=failed)")
-        forceMaxVolume()
+
+        // The only place a "restricted" warning is judged: nobody is touching the keys yet.
+        if (!forceMaxVolume()) {
+            SpikeLog.add(ctx, "ALARM: WARNING could not raise alarm volume to max at start (restricted?)")
+        }
+        registerVolumeReceiver()
         startPlayer()
         handler.post(tick)
         if (autoStopMs != null) handler.postDelayed({ stop() }, autoStopMs)
@@ -75,6 +101,7 @@ class AlarmPlayer(private val ctx: Context) {
         if (!active) return
         active = false
         handler.removeCallbacksAndMessages(null)
+        unregisterVolumeReceiver()
         releasePlayer()
         runCatching { audio.abandonAudioFocusRequest(focusRequest) }
         savedVolume?.let { v -> runCatching { audio.setStreamVolume(AudioManager.STREAM_ALARM, v, 0) } }
@@ -83,22 +110,33 @@ class AlarmPlayer(private val ctx: Context) {
         SpikeLog.add(ctx, "ALARM: stopped")
     }
 
-    private fun forceMaxVolume() {
-        try {
-            val max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM)
-            if (audio.getStreamVolume(AudioManager.STREAM_ALARM) != max) {
-                audio.setStreamVolume(AudioManager.STREAM_ALARM, max, 0)
-                if (audio.getStreamVolume(AudioManager.STREAM_ALARM) != max) warnVolume("change had no effect")
-            }
-        } catch (e: Exception) {
-            warnVolume("API failed: ${e.javaClass.simpleName}")
+    /** Returns true if the alarm stream is at maximum afterwards. */
+    private fun forceMaxVolume(): Boolean = try {
+        val max = audio.getStreamMaxVolume(AudioManager.STREAM_ALARM)
+        if (audio.getStreamVolume(AudioManager.STREAM_ALARM) != max) {
+            audio.setStreamVolume(AudioManager.STREAM_ALARM, max, 0)
         }
+        audio.getStreamVolume(AudioManager.STREAM_ALARM) == max
+    } catch (e: Exception) {
+        if (!volumeErrorLogged) {
+            volumeErrorLogged = true
+            SpikeLog.add(ctx, "ALARM: volume API failed: ${e.javaClass.simpleName}")
+        }
+        false
     }
 
-    private fun warnVolume(why: String) {
-        if (volumeWarned) return
-        volumeWarned = true
-        SpikeLog.add(ctx, "ALARM: WARNING volume control restricted ($why)")
+    private fun registerVolumeReceiver() {
+        if (receiverRegistered) return
+        ContextCompat.registerReceiver(
+            ctx, volumeReceiver, IntentFilter(VOLUME_CHANGED_ACTION), ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        receiverRegistered = true
+    }
+
+    private fun unregisterVolumeReceiver() {
+        if (!receiverRegistered) return
+        runCatching { ctx.unregisterReceiver(volumeReceiver) }
+        receiverRegistered = false
     }
 
     private fun defaultUri(): Uri? =
