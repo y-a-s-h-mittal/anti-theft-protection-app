@@ -62,3 +62,7 @@ secrets.json
 # Crash dumps
 hs_err_pid*
 replay_pid*
+
+# Alarm sound is not distributed (licensing). Add your own at res/raw/atp_alarm.mp3
+android/app/src/main/res/raw/*
+!android/app/src/main/res/raw/.gitkeep

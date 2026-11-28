@@ -17,11 +17,13 @@ class NativeStatus {
   final bool serviceRunning;
   final int remainingMs;
   final int countdownSeconds;
+  final bool hasPin;
 
   const NativeStatus({
     required this.state,
     required this.serviceRunning,
     this.remainingMs = 0,
     this.countdownSeconds = 10,
+    this.hasPin = false,
   });
 }

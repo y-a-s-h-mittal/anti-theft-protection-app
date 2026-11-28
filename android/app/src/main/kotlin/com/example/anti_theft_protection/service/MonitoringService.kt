@@ -8,6 +8,7 @@ import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import com.example.anti_theft_protection.MainActivity
+import com.example.anti_theft_protection.alarm.AlarmPlayer
 import com.example.anti_theft_protection.alarm.CountdownManager
 import com.example.anti_theft_protection.sim.SimMonitor
 import com.example.anti_theft_protection.state.ProtectionState
@@ -19,24 +20,27 @@ class MonitoringService : Service() {
         @Volatile var running = false
         private const val CHANNEL_ID = "monitoring"
         private const val NOTIF_ID = 1
+        private const val FGS_TYPES =
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE or
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
     }
 
     private var monitor: SimMonitor? = null
-    private lateinit var countdown: CountdownManager   // needs a real Context, so built in onCreate
+    private lateinit var countdown: CountdownManager   // need a real Context, so built in onCreate
+    private lateinit var alarm: AlarmPlayer
 
     override fun onCreate() {
         super.onCreate()
         countdown = CountdownManager(this) { onCountdownExpired() }
+        alarm = AlarmPlayer(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val state = ProtectionStore.getState(this)
         // Android requires startForeground() soon after startForegroundService(),
-        // even if we stop right afterwards.
-        ServiceCompat.startForeground(
-            this, NOTIF_ID, buildNotification(state),
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        )
+        // even if we stop right afterwards. The mediaPlayback type is what lets us play audio
+        // from the background on Android 17.
+        ServiceCompat.startForeground(this, NOTIF_ID, buildNotification(state), FGS_TYPES)
 
         if (state == ProtectionState.DISARMED) {
             stopSelf()
@@ -52,10 +56,14 @@ class MonitoringService : Service() {
                 onRestoreConfirmed = { onRestored() },
             ).also { it.start() }
 
-            if (state == ProtectionState.COUNTDOWN) {   // service was recreated mid-countdown
+            if (state == ProtectionState.COUNTDOWN) {   // recreated mid-countdown
                 val latest = SystemClock.elapsedRealtime() + ProtectionStore.getCountdownSeconds(this) * 1000L
                 countdown.start(minOf(ProtectionStore.getDeadline(this), latest))
                 SpikeLog.add(this, "COUNTDOWN resumed after service restart")
+            }
+            if (state == ProtectionState.ALARMING) {    // recreated mid-alarm
+                SpikeLog.add(this, "ALARM resumed after service restart")
+                alarm.start()
             }
         }
         running = true
@@ -86,7 +94,7 @@ class MonitoringService : Service() {
         ProtectionStore.setState(this, ProtectionState.ALARMING)
         SpikeLog.add(this, "STATE COUNTDOWN -> ALARMING (countdown expired)")
         refreshNotification()
-        // Stage 1C: start AlarmPlayer here.
+        alarm.start()
     }
 
     private fun buildNotification(state: ProtectionState): Notification {
@@ -101,7 +109,7 @@ class MonitoringService : Service() {
         val text = when (state) {
             ProtectionState.ARMED -> "Armed: watching the SIM"
             ProtectionState.COUNTDOWN -> "SIM missing: alarm in"
-            ProtectionState.ALARMING -> "ALARM ACTIVE"
+            ProtectionState.ALARMING -> "ALARM ACTIVE: open the app and enter your PIN"
             ProtectionState.DISARMED -> "Disarmed"
         }
         val b = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -127,6 +135,7 @@ class MonitoringService : Service() {
     }
 
     override fun onDestroy() {
+        alarm.stop()          // also restores the owner's alarm volume
         countdown.cancel()
         monitor?.stop()
         monitor = null
